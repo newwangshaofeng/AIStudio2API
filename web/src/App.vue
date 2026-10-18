@@ -231,7 +231,7 @@ async function loadAccounts(): Promise<void> {
 }
 
 async function loadAccountData(): Promise<void> {
-  await Promise.all([loadAccounts(), loadModels(), loadStatus(), loadAccountQuota()])
+  await Promise.all([loadAccounts(), loadModels(), loadStatus(), loadAccountQuota(), loadCooldowns()])
 }
 
 // loadAccountQuota 拉取太平洋时间当日各账户通道用量，失败时保留上一次结果

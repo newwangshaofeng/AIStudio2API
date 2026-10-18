@@ -32,7 +32,7 @@ const emit = defineEmits<{
   delete: [account: Account]
 }>()
 
-const { t, locale, errorText } = useI18n()
+const { t, locale, errorText, logText } = useI18n()
 const defaultAccountLocale = navigator.language || 'en-US'
 const defaultAccountTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 const showEditor = ref(false)
@@ -149,9 +149,51 @@ function percentTone(percent: number): string {
 // channelCooldowns 返回账户在该通道上仍在生效的冷却；依赖 quotaClock 使到期项自动消失
 function channelCooldowns(account: Account, channel: UpstreamChannel): Cooldown[] {
   const at = quotaClock.value
-  return (props.cooldowns ?? []).filter(
-    (item) => item.account_id === account.id && item.channel === channel && Date.parse(item.until) > at,
-  )
+  return (props.cooldowns ?? [])
+    .filter(
+      (item) => item.account_id === account.id && item.channel === channel && Date.parse(item.until) > at,
+    )
+    .sort((left, right) => Date.parse(left.until) - Date.parse(right.until))
+}
+
+// splitReason 把冷却原因拆成冷却类型与上游错误原文
+function splitReason(reason: string | undefined): { category: string; text: string } {
+  const value = reason ?? ''
+  const separator = value.indexOf(': ')
+  if (separator > 0) {
+    return { category: value.slice(0, separator), text: value.slice(separator + 2) }
+  }
+  if (value && value.length <= 10 && !value.includes(' ')) {
+    return { category: value, text: '' }
+  }
+  return { category: '', text: value }
+}
+
+// categoryLabel 返回冷却类型的当前语言名称，没有类型时为其他
+function categoryLabel(category: string): string {
+  return category ? logText(category) : t('cooldowns.other')
+}
+
+// formatCooldownTime 根据当前语言格式化冷却恢复时间
+function formatCooldownTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat(locale.value, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(date)
+}
+
+// cooldownTooltip 返回包含模型、类别、恢复时间与完整原因的提示
+function cooldownTooltip(cooldown: Cooldown): string {
+  const category = categoryLabel(splitReason(cooldown.reason).category)
+  const time = formatCooldownTime(cooldown.until)
+  const detail = splitReason(cooldown.reason).text
+  const header = `${cooldown.model_id} · ${category} · ${time}`
+  return detail ? `${header}\n${detail}` : header
 }
 
 // formatTokens 把 token 数缩写为 K/M
@@ -580,7 +622,14 @@ async function refreshAllAccounts(): Promise<void> {
               class="rounded border border-line/70 bg-canvas/60 px-3 py-2"
             >
               <div class="flex items-center justify-between gap-2">
-                <span class="text-xs font-medium text-gray-300">{{ t(channelLabelKey(channel)) }}</span>
+                <div class="flex min-w-0 items-center gap-1.5">
+                  <span class="text-xs font-medium text-gray-300">{{ t(channelLabelKey(channel)) }}</span>
+                  <span
+                    v-if="channelCooldowns(account, channel).length > 0"
+                    class="h-1.5 w-1.5 shrink-0 rounded-full bg-yellow-400"
+                    :title="t('state.cooldown')"
+                  ></span>
+                </div>
                 <span class="font-mono text-[11px] text-gray-500">
                   {{ channelStats(account, channel).requests }} / {{ channelLimit(channel) }}
                 </span>
@@ -592,7 +641,7 @@ async function refreshAllAccounts(): Promise<void> {
                   :style="{ width: `${channelPercent(account, channel)}%` }"
                 ></div>
               </div>
-              <div class="mt-1 flex flex-wrap items-center gap-x-2 text-[11px] text-gray-500">
+              <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-gray-500">
                 <span
                   >{{ formatTokens(channelStats(account, channel).total_tokens) }}
                   {{ t('accounts.quotaTokens') }}</span
@@ -611,10 +660,16 @@ async function refreshAllAccounts(): Promise<void> {
                 <span
                   v-for="cooldown in channelCooldowns(account, channel)"
                   :key="`${cooldown.channel}:${cooldown.model_id}`"
-                  v-tooltip="cooldown.reason ?? ''"
-                  class="rounded border border-yellow-900/50 bg-yellow-900/20 px-1.5 text-yellow-300"
+                  v-tooltip="cooldownTooltip(cooldown)"
+                  class="inline-flex items-center gap-1.5 rounded border border-yellow-900/50 bg-yellow-900/20 px-1.5 py-0.5 text-yellow-300"
                 >
-                  {{ cooldown.model_id }}
+                  <span class="font-mono font-medium">{{ cooldown.model_id }}</span>
+                  <span class="rounded bg-yellow-500/20 px-1 text-[10px] font-medium text-yellow-200">
+                    {{ categoryLabel(splitReason(cooldown.reason).category) }}
+                  </span>
+                  <time class="font-mono text-[10px] text-yellow-400/90">
+                    {{ formatCooldownTime(cooldown.until) }}
+                  </time>
                 </span>
               </div>
             </div>
