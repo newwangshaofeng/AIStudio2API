@@ -12,8 +12,11 @@ import (
 
 const quotaResetTimezone = "America/Los_Angeles"
 
-// planLimitBackoff 为没有恢复时间的套餐限额按连续次数递增的冷却时长
+// planLimitBackoff 为需要探测恢复的递增冷却时长，当前只用于 Build 拒绝
 var planLimitBackoff = []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour}
+
+// planQuotaResetBuffer 是套餐限额在太平洋时间 00:00 重置后等待上游结算的缓冲
+const planQuotaResetBuffer = 5 * time.Minute
 
 // quotaLimitPattern 匹配额度错误中逐项列出的额度上限
 var quotaLimitPattern = regexp.MustCompile(`limit: (\d+)`)
@@ -72,7 +75,8 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 	if rpcError.RetryDelay > 0 {
 		until = now.Add(rpcError.RetryDelay)
 	} else if kind == "短期限额" && strings.Contains(message, "reached your usage limit") {
-		kind, escalate = "套餐限额", true
+		// 套餐限额按官方日重置窗口恢复，不再递增探测：直接冷却到下一个太平洋时间 00:05
+		kind, until = "套餐限额", planQuotaReset(now)
 	}
 	return QuotaCooldown{Until: until, Global: global, Kind: kind, Reason: kind + ": " + err.Error(), Escalate: escalate}, true
 }
@@ -138,4 +142,9 @@ func nextQuotaDay(now time.Time) time.Time {
 	}
 	local := now.In(location)
 	return time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, location)
+}
+
+// planQuotaReset 返回套餐限额的恢复时刻：下一个太平洋时间 00:00 加缓冲，避开重置瞬间的滚动结算
+func planQuotaReset(now time.Time) time.Time {
+	return nextQuotaDay(now).Add(planQuotaResetBuffer)
 }

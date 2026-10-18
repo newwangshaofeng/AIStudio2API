@@ -165,6 +165,40 @@ export interface Cooldown {
 
 export type RequestState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'
 
+// AccountChannelStats 是单个账户在单个上游通道上的当日用量
+export interface AccountChannelStats {
+  channel: UpstreamChannel
+  requests: number
+  succeeded: number
+  failed: number
+  canceled: number
+  rate_limited: number
+  rejected: number
+  tool_calls: number
+  input_tokens: number
+  cached_tokens: number
+  reasoning_tokens: number
+  reply_tokens: number
+  total_tokens: number
+  last_at?: string
+}
+
+// AccountQuotaSummary 汇总单个账户三个通道的当日用量
+export interface AccountQuotaSummary {
+  account: string
+  channels: Partial<Record<UpstreamChannel, AccountChannelStats>>
+}
+
+// AccountQuotaReport 返回太平洋时间当日窗口、各账户用量与最近单日峰值
+export interface AccountQuotaReport {
+  window_start: string
+  reset_at: string
+  timezone: string
+  generated_at: string
+  accounts: Record<string, AccountQuotaSummary>
+  peaks: Partial<Record<UpstreamChannel, number>>
+}
+
 export interface RequestSummary {
   id: string
   model: string

@@ -24,6 +24,7 @@ import { api, openAdminEvents, type EventConnection } from '@/api'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
   Account,
+  AccountQuotaReport,
   AdminLog,
   AdminEvent,
   Model,
@@ -92,6 +93,7 @@ const logs = shallowRef<AdminLog[]>([])
 const accounts = ref<Account[]>([])
 const models = ref<Model[]>([])
 const cooldowns = ref<Cooldown[]>([])
+const accountQuota = ref<AccountQuotaReport | null>(null)
 const requests = ref<RequestSummary[]>([])
 const config = ref<ServiceConfig | null>(null)
 const update = ref<UpdateStatus | null>(null)
@@ -108,6 +110,7 @@ const loading = reactive({
 })
 const errors = reactive({ accounts: '', models: '', requests: '', cooldowns: '', config: '' })
 let eventConnection: EventConnection | undefined
+let accountQuotaTimer: number | undefined
 let mounted = false
 let noticeTimer: number | undefined
 const pendingDelete = shallowRef<{ account: Account; timer: number } | null>(null)
@@ -228,7 +231,16 @@ async function loadAccounts(): Promise<void> {
 }
 
 async function loadAccountData(): Promise<void> {
-  await Promise.all([loadAccounts(), loadModels(), loadStatus()])
+  await Promise.all([loadAccounts(), loadModels(), loadStatus(), loadAccountQuota()])
+}
+
+// loadAccountQuota 拉取太平洋时间当日各账户通道用量，失败时保留上一次结果
+async function loadAccountQuota(): Promise<void> {
+  try {
+    accountQuota.value = await api.accountQuota()
+  } catch {
+    accountQuota.value = accountQuota.value ?? null
+  }
 }
 
 async function loadModels(): Promise<void> {
@@ -291,6 +303,7 @@ async function refreshAll(): Promise<void> {
     loadCooldowns(),
     loadRequests(),
     loadConfig(),
+    loadAccountQuota(),
   ])
 }
 
@@ -371,6 +384,15 @@ function waitForRestart(previous = status.value?.version): void {
   }, 1000)
 }
 
+// scheduleAccountQuotaRefresh 合并短时间内的请求事件，避免每次事件都重新聚合额度
+function scheduleAccountQuotaRefresh(): void {
+  if (accountQuotaTimer !== undefined) return
+  accountQuotaTimer = window.setTimeout(() => {
+    accountQuotaTimer = undefined
+    void loadAccountQuota()
+  }, 2000)
+}
+
 function handleAdminEvent(event: AdminEvent): void {
   if (event.type === 'status') {
     status.value = event.data
@@ -394,6 +416,10 @@ function handleAdminEvent(event: AdminEvent): void {
   if (event.type === 'cooldowns') {
     cooldowns.value = event.data
     return
+  }
+  if (event.type === 'request') {
+    // 请求完成后当日用量会变化，按节流重新拉取额度
+    scheduleAccountQuotaRefresh()
   }
   replaceByID(requests.value, event.data)
 }
@@ -427,6 +453,7 @@ watch(locale, () => {
 onUnmounted(() => {
   mounted = false
   eventConnection?.close()
+  if (accountQuotaTimer !== undefined) window.clearTimeout(accountQuotaTimer)
   if (logFlushTimer !== undefined) window.clearTimeout(logFlushTimer)
   if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
   window.removeEventListener('pagehide', flushDelete)
@@ -602,6 +629,8 @@ onUnmounted(() => {
             :accounts="visibleAccounts"
             :loading="loading.accounts"
             :error="errors.accounts"
+            :quota="accountQuota"
+            :cooldowns="cooldowns"
             @refresh="loadAccountData"
             @notice="showNotice"
             @delete="deleteAccount"

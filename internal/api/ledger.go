@@ -31,6 +31,7 @@ type RequestLedger interface {
 	BodyCapture() bool
 	SaveBody(RequestBody)
 	Usage(context.Context, UsageQuery) (UsageReport, error)
+	AccountQuota(context.Context, time.Time) (AccountQuotaReport, error)
 	Records(context.Context, UsageRecordQuery) (UsageRecordPage, error)
 	ExportRecords(context.Context, UsageRecordQuery, io.Writer) error
 	RequestBody(context.Context, string) (RequestBody, error)
@@ -219,12 +220,57 @@ type RequestBody struct {
 	ResponseSize int64     `json:"response_size"`
 }
 
-// registerLedger 注册用量统计、请求记录与请求正文接口
+// AccountChannelStats 汇总单个账户在单个上游通道上的当日请求与 token 用量；Rejected 是被上游拒绝后改走其他通道的尝试次数
+type AccountChannelStats struct {
+	Channel         string     `json:"channel"`
+	Requests        int64      `json:"requests"`
+	Succeeded       int64      `json:"succeeded"`
+	Failed          int64      `json:"failed"`
+	Canceled        int64      `json:"canceled"`
+	RateLimited     int64      `json:"rate_limited"`
+	Rejected        int64      `json:"rejected"`
+	ToolCalls       int64      `json:"tool_calls"`
+	InputTokens     int64      `json:"input_tokens"`
+	CachedTokens    int64      `json:"cached_tokens"`
+	ReasoningTokens int64      `json:"reasoning_tokens"`
+	ReplyTokens     int64      `json:"reply_tokens"`
+	TotalTokens     int64      `json:"total_tokens"`
+	LastAt          *time.Time `json:"last_at,omitempty"`
+}
+
+// AccountQuotaSummary 汇总单个账户各通道的当日用量，Channels 以通道名为键
+type AccountQuotaSummary struct {
+	Account  string                         `json:"account"`
+	Channels map[string]AccountChannelStats `json:"channels"`
+}
+
+// AccountQuotaReport 返回太平洋时间当日窗口、各账户通道用量与最近单日峰值参考上限
+type AccountQuotaReport struct {
+	WindowStart time.Time                      `json:"window_start"`
+	ResetAt     time.Time                      `json:"reset_at"`
+	Timezone    string                         `json:"timezone"`
+	GeneratedAt time.Time                      `json:"generated_at"`
+	Accounts    map[string]AccountQuotaSummary `json:"accounts"`
+	Peaks       map[string]int64               `json:"peaks"`
+}
+
+// registerLedger 注册用量统计、账户额度、请求记录与请求正文接口
 func (s *server) registerLedger(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/usage", s.handleUsage)
+	mux.HandleFunc("GET /api/accounts/quota", s.handleAccountQuota)
 	mux.HandleFunc("GET /api/usage/records", s.handleUsageRecords)
 	mux.HandleFunc("GET /api/usage/records.csv", s.handleUsageExport)
 	mux.HandleFunc("GET /api/requests/{id}/body", s.handleRequestBody)
+}
+
+// handleAccountQuota 返回账户页使用的太平洋时间当日通道用量
+func (s *server) handleAccountQuota(w http.ResponseWriter, r *http.Request) {
+	report, err := s.config.Ledger.AccountQuota(r.Context(), time.Now())
+	if err != nil {
+		writeAdminError(w, statusFromError(err), "usage_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 // usageBucketSizes 是允许手动选择的分桶时长

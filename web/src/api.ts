@@ -3,6 +3,7 @@ import type {
   Account,
   AccountDraft,
   AccountLoginInput,
+  AccountQuotaReport,
   AccountRefresh,
   AdminEvent,
   ChromeImportInput,
@@ -162,6 +163,7 @@ export const api = {
   accounts: async () => (await requestJSON<AccountsResponse>('/api/accounts')).accounts,
   models: async () => (await requestJSON<ModelsResponse>('/api/models')).models,
   cooldowns: async () => (await requestJSON<CooldownsResponse>('/api/cooldowns')).cooldowns,
+  accountQuota: () => requestJSON<AccountQuotaReport>('/api/accounts/quota'),
   requests: async () => (await requestJSON<RequestsResponse>('/api/requests')).requests,
   config: () => requestJSON<ServiceConfig>('/api/config'),
   usage: (query: URLSearchParams, signal?: AbortSignal) =>

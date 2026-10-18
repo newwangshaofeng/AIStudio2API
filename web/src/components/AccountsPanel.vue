@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, onUnmounted, reactive, ref } from 'vue'
 import { api } from '@/api'
-import { useI18n, type TranslationKey } from '@/i18n'
+import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import { maskedProxy } from '@/proxy'
 import type {
   Account,
+  AccountChannelStats,
   AccountDraft,
+  AccountQuotaReport,
   AccountRefresh,
   AccountState,
   ChromeImportProfile,
+  Cooldown,
   PairingToken,
+  UpstreamChannel,
 } from '@/types'
 import DetailDialog from './DetailDialog.vue'
 import UiIcon from './UiIcon.vue'
@@ -18,6 +22,8 @@ const props = defineProps<{
   accounts: Account[]
   loading: boolean
   error: string
+  quota: AccountQuotaReport | null
+  cooldowns?: Cooldown[]
 }>()
 
 const emit = defineEmits<{
@@ -84,6 +90,89 @@ const stateKeys: Record<AccountState, TranslationKey> = {
 
 // messageAccount 是悬窗中显示完整状态原因的账户
 const messageAccount = ref<Account | null>(null)
+
+// quotaChannels 是账户卡下方按通道展示的额度顺序
+const quotaChannels: UpstreamChannel[] = ['playground', 'build', 'assistant']
+
+// quotaReference 是实测参考的每日请求上限：Playground 旗舰模型约 50 次触发套餐限额，
+// Flash 与 Build 免费额度按官方 1500 RPD 计；最近 30 天单日峰值更高时以峰值为准
+const quotaReference: Record<UpstreamChannel, number> = {
+  playground: 50,
+  build: 1500,
+  assistant: 1500,
+}
+
+// emptyChannelStats 返回没有用量时的空统计
+function emptyChannelStats(channel: UpstreamChannel): AccountChannelStats {
+  return {
+    channel,
+    requests: 0,
+    succeeded: 0,
+    failed: 0,
+    canceled: 0,
+    rate_limited: 0,
+    rejected: 0,
+    tool_calls: 0,
+    input_tokens: 0,
+    cached_tokens: 0,
+    reasoning_tokens: 0,
+    reply_tokens: 0,
+    total_tokens: 0,
+  }
+}
+
+// channelStats 返回账户在指定通道的当日用量
+function channelStats(account: Account, channel: UpstreamChannel): AccountChannelStats {
+  return props.quota?.accounts[account.id]?.channels[channel] ?? emptyChannelStats(channel)
+}
+
+// channelLimit 返回通道参考上限，历史单日峰值更高时使用峰值
+function channelLimit(channel: UpstreamChannel): number {
+  const peak = props.quota?.peaks[channel] ?? 0
+  return Math.max(quotaReference[channel], peak)
+}
+
+// channelPercent 返回用量占参考上限的百分比，封顶 100
+function channelPercent(account: Account, channel: UpstreamChannel): number {
+  const limit = channelLimit(channel)
+  if (limit <= 0) return 0
+  return Math.min(100, Math.round((channelStats(account, channel).requests / limit) * 100))
+}
+
+// percentTone 按占用比例返回进度条颜色，接近上限时转为警示色
+function percentTone(percent: number): string {
+  if (percent >= 90) return 'bg-red-500'
+  if (percent >= 70) return 'bg-yellow-500'
+  return 'bg-blue-500'
+}
+
+// channelCooldowns 返回账户在该通道上仍在生效的冷却；依赖 quotaClock 使到期项自动消失
+function channelCooldowns(account: Account, channel: UpstreamChannel): Cooldown[] {
+  const at = quotaClock.value
+  return (props.cooldowns ?? []).filter(
+    (item) => item.account_id === account.id && item.channel === channel && Date.parse(item.until) > at,
+  )
+}
+
+// formatTokens 把 token 数缩写为 K/M
+function formatTokens(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  return String(value)
+}
+
+// resetCountdown 返回距离太平洋时间 00:00 重置的倒计时
+const quotaClock = ref(Date.now())
+const quotaClockTimer = window.setInterval(() => (quotaClock.value = Date.now()), 30_000)
+onUnmounted(() => window.clearInterval(quotaClockTimer))
+const resetCountdown = computed(() => {
+  const resetAt = props.quota?.reset_at ? Date.parse(props.quota.reset_at) : Number.NaN
+  if (Number.isNaN(resetAt)) return ''
+  const remaining = Math.max(0, resetAt - quotaClock.value)
+  const hours = Math.floor(remaining / 3_600_000)
+  const minutes = Math.floor((remaining % 3_600_000) / 60_000)
+  return `${hours}h ${String(minutes).padStart(2, '0')}m`
+})
 
 // accountSummary 把账户等级、出口、语言与时区合成一行
 function accountSummary(account: Account): string {
@@ -311,6 +400,9 @@ async function refreshAllAccounts(): Promise<void> {
       <div class="min-w-0 flex-1">
         <h2 class="text-xl font-semibold text-white">{{ t('section.accounts.title') }}</h2>
         <p class="mt-1 text-sm text-gray-500">{{ t('section.accounts.description') }}</p>
+        <p v-if="resetCountdown" class="mt-1 text-xs text-gray-500">
+          {{ t('accounts.quotaReset') }} {{ resetCountdown }}
+        </p>
       </div>
       <div class="flex flex-wrap justify-end gap-2">
         <button
@@ -375,109 +467,157 @@ async function refreshAllAccounts(): Promise<void> {
         <div
           v-for="account in accounts"
           :key="account.id"
-          class="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line/60 px-4 py-2.5"
+          class="border-b border-line/60 px-4 py-2.5"
           :class="{ 'opacity-60': !account.enabled }"
         >
-          <div class="flex min-w-0 flex-1 basis-72 items-center gap-3">
-            <div
-              class="h-2.5 w-2.5 shrink-0 rounded-full"
-              :class="{
-                'bg-green-500': account.state === 'ready',
-                'bg-blue-500': account.state === 'busy',
-                'bg-yellow-500': account.state === 'cooldown',
-                'bg-red-500': account.state === 'auth_required' || account.state === 'unavailable',
-                'bg-gray-500': account.state === 'disabled',
-              }"
-            ></div>
-            <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div class="flex min-w-0 flex-1 basis-72 items-center gap-3">
+              <div
+                class="h-2.5 w-2.5 shrink-0 rounded-full"
+                :class="{
+                  'bg-green-500': account.state === 'ready',
+                  'bg-blue-500': account.state === 'busy',
+                  'bg-yellow-500': account.state === 'cooldown',
+                  'bg-red-500': account.state === 'auth_required' || account.state === 'unavailable',
+                  'bg-gray-500': account.state === 'disabled',
+                }"
+              ></div>
+              <div class="min-w-0">
+                <span
+                  v-tooltip.overflow="account.label"
+                  class="block truncate font-mono text-sm text-white"
+                  >{{ account.label }}</span
+                >
+                <span
+                  v-tooltip.overflow="accountSummary(account)"
+                  class="block truncate text-xs text-gray-500"
+                  >{{ accountSummary(account) }}</span
+                >
+              </div>
+            </div>
+            <span class="w-16 shrink-0 text-xs text-gray-500"
+              >{{ t('accounts.models') }}
+              {{ account.models.length === 0 ? '—' : account.models.length }}</span
+            >
+            <div class="flex w-36 shrink-0 items-center gap-2">
               <span
-                v-tooltip.overflow="account.label"
-                class="block truncate font-mono text-sm text-white"
-                >{{ account.label }}</span
+                class="text-xs font-medium uppercase"
+                :class="{
+                  'text-green-400': account.state === 'ready',
+                  'text-blue-400': account.state === 'busy',
+                  'text-yellow-400': account.state === 'cooldown',
+                  'text-red-400':
+                    account.state === 'auth_required' || account.state === 'unavailable',
+                  'text-gray-500': account.state === 'disabled',
+                }"
               >
-              <span
-                v-tooltip.overflow="accountSummary(account)"
-                class="block truncate text-xs text-gray-500"
-                >{{ accountSummary(account) }}</span
+                {{ t(stateKeys[account.state]) }}
+              </span>
+              <button
+                v-if="account.message"
+                type="button"
+                class="rounded border border-red-900/50 bg-red-900/20 px-1.5 py-0.5 text-[11px] text-red-300 transition hover:bg-red-900/40"
+                @click="messageAccount = account"
               >
+                {{ t('accounts.reason') }}
+              </button>
+            </div>
+            <div class="flex shrink-0 flex-wrap justify-end gap-2">
+              <button
+                class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction !== '' || refreshing.has(account.id)"
+                @click="beginEdit(account)"
+              >
+                {{ t('common.edit') }}
+              </button>
+              <button
+                class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction !== '' || refreshing.has(account.id)"
+                :aria-busy="pendingAction === `toggle:${account.id}`"
+                @click="toggleAccount(account)"
+              >
+                {{ t(account.enabled ? 'common.disable' : 'common.enable') }}
+              </button>
+              <button
+                v-if="account.state === 'auth_required'"
+                class="rounded bg-green-600 px-3 py-1 text-xs text-white transition hover:bg-green-500 disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction !== '' || refreshing.has(account.id) || !account.enabled"
+                :aria-busy="pendingAction === `login:${account.id}`"
+                @click="loginAccount(account)"
+              >
+                {{ t('common.relogin') }}
+              </button>
+              <button
+                class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
+                type="button"
+                :disabled="
+                  refreshing.has(account.id) ||
+                  pendingAction === `login:${account.id}` ||
+                  !account.enabled
+                "
+                :aria-busy="refreshing.has(account.id)"
+                @click="refreshAccount(account)"
+              >
+                {{ t('accounts.refresh') }}
+              </button>
+              <button
+                class="rounded border border-red-900/50 bg-red-900/30 px-3 py-1 text-xs text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction !== '' || refreshing.has(account.id)"
+                @click="emit('delete', account)"
+              >
+                {{ t('common.delete') }}
+              </button>
             </div>
           </div>
-          <span class="w-16 shrink-0 text-xs text-gray-500"
-            >{{ t('accounts.models') }}
-            {{ account.models.length === 0 ? '—' : account.models.length }}</span
-          >
-          <div class="flex w-36 shrink-0 items-center gap-2">
-            <span
-              class="text-xs font-medium uppercase"
-              :class="{
-                'text-green-400': account.state === 'ready',
-                'text-blue-400': account.state === 'busy',
-                'text-yellow-400': account.state === 'cooldown',
-                'text-red-400':
-                  account.state === 'auth_required' || account.state === 'unavailable',
-                'text-gray-500': account.state === 'disabled',
-              }"
+          <div class="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div
+              v-for="channel in quotaChannels"
+              :key="channel"
+              class="rounded border border-line/70 bg-canvas/60 px-3 py-2"
             >
-              {{ t(stateKeys[account.state]) }}
-            </span>
-            <button
-              v-if="account.message"
-              type="button"
-              class="rounded border border-red-900/50 bg-red-900/20 px-1.5 py-0.5 text-[11px] text-red-300 transition hover:bg-red-900/40"
-              @click="messageAccount = account"
-            >
-              {{ t('accounts.reason') }}
-            </button>
-          </div>
-          <div class="flex shrink-0 flex-wrap justify-end gap-2">
-            <button
-              class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction !== '' || refreshing.has(account.id)"
-              @click="beginEdit(account)"
-            >
-              {{ t('common.edit') }}
-            </button>
-            <button
-              class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction !== '' || refreshing.has(account.id)"
-              :aria-busy="pendingAction === `toggle:${account.id}`"
-              @click="toggleAccount(account)"
-            >
-              {{ t(account.enabled ? 'common.disable' : 'common.enable') }}
-            </button>
-            <button
-              v-if="account.state === 'auth_required'"
-              class="rounded bg-green-600 px-3 py-1 text-xs text-white transition hover:bg-green-500 disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction !== '' || refreshing.has(account.id) || !account.enabled"
-              :aria-busy="pendingAction === `login:${account.id}`"
-              @click="loginAccount(account)"
-            >
-              {{ t('common.relogin') }}
-            </button>
-            <button
-              class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
-              type="button"
-              :disabled="
-                refreshing.has(account.id) ||
-                pendingAction === `login:${account.id}` ||
-                !account.enabled
-              "
-              :aria-busy="refreshing.has(account.id)"
-              @click="refreshAccount(account)"
-            >
-              {{ t('accounts.refresh') }}
-            </button>
-            <button
-              class="rounded border border-red-900/50 bg-red-900/30 px-3 py-1 text-xs text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction !== '' || refreshing.has(account.id)"
-              @click="emit('delete', account)"
-            >
-              {{ t('common.delete') }}
-            </button>
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-xs font-medium text-gray-300">{{ t(channelLabelKey(channel)) }}</span>
+                <span class="font-mono text-[11px] text-gray-500">
+                  {{ channelStats(account, channel).requests }} / {{ channelLimit(channel) }}
+                </span>
+              </div>
+              <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-line">
+                <div
+                  class="h-full rounded-full transition-all"
+                  :class="percentTone(channelPercent(account, channel))"
+                  :style="{ width: `${channelPercent(account, channel)}%` }"
+                ></div>
+              </div>
+              <div class="mt-1 flex flex-wrap items-center gap-x-2 text-[11px] text-gray-500">
+                <span
+                  >{{ formatTokens(channelStats(account, channel).total_tokens) }}
+                  {{ t('accounts.quotaTokens') }}</span
+                >
+                <span
+                  v-if="channelStats(account, channel).rate_limited > 0"
+                  class="text-yellow-400"
+                >
+                  {{ t('accounts.quotaRateLimited') }}
+                  {{ channelStats(account, channel).rate_limited }}
+                </span>
+                <span v-if="channelStats(account, channel).rejected > 0" class="text-red-400">
+                  {{ t('accounts.quotaRejected') }}
+                  {{ channelStats(account, channel).rejected }}
+                </span>
+                <span
+                  v-for="cooldown in channelCooldowns(account, channel)"
+                  :key="`${cooldown.channel}:${cooldown.model_id}`"
+                  v-tooltip="cooldown.reason ?? ''"
+                  class="rounded border border-yellow-900/50 bg-yellow-900/20 px-1.5 text-yellow-300"
+                >
+                  {{ cooldown.model_id }}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
